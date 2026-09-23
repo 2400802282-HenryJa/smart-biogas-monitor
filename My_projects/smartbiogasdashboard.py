@@ -1,38 +1,40 @@
-# ============================================================
-# 🌱 HEXNN SMART BIOGAS SYSTEM
-# Visual monitoring dashboard — Streamlit Community Cloud
-# ============================================================
 
-import streamlit as st
+import os
+import time
+import sqlite3
+from datetime import datetime
+
 import pandas as pd
+import requests
+import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
-import os
-import sqlite3
-import time
-from datetime import datetime
-import requests
-import sib_api_v3_sdk
-from sib_api_v3_sdk.rest import ApiException
+from dotenv import load_dotenv
 
 
 # ============================================================
-# 🔐 STREAMLIT CLOUD SECRETS
-# ============================================================
-# Configure these once in:
-# Streamlit Community Cloud → App → Settings → Secrets
-#
-# EMAIL_SENDER
-# BREVO_API_KEY
-# TELEGRAM_BOT_TOKEN
-# TELEGRAM_CHAT_ID
-#
-# No .env file is required for the deployed application.
+# HEXNN SMART BIOGAS MONITORING DASHBOARD
 # ============================================================
 
-def get_secret(name, default=None):
+st.set_page_config(
+    page_title="Hexnn Smart Biogas",
+    page_icon="🌱",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+load_dotenv()
+
+
+# ============================================================
+# SECRETS
+# Streamlit Cloud: Settings -> Secrets
+# Local development: optional .env fallback
+# ============================================================
+
+def get_secret(name, default=""):
     try:
-        value = st.secrets.get(name)
+        value = st.secrets.get(name, default)
         if value:
             return value
     except Exception:
@@ -47,330 +49,190 @@ TELEGRAM_CHAT_ID = get_secret("TELEGRAM_CHAT_ID")
 
 
 # ============================================================
-# ⚙️ PAGE CONFIG
+# SESSION STATE
 # ============================================================
 
-st.set_page_config(
-    page_title="Hexnn Smart Biogas",
-    page_icon="🌱",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+if "last_sent_time" not in st.session_state:
+    st.session_state.last_sent_time = {}
+
+if "alert_log" not in st.session_state:
+    st.session_state.alert_log = []
+
+if "activity_feed" not in st.session_state:
+    st.session_state.activity_feed = []
 
 
 # ============================================================
-# 🗄️ LOCAL APP DATA
-# ============================================================
-# This database is only used for subscriber records.
-# Secrets are NOT stored here.
+# DATABASE
 # ============================================================
 
-conn = sqlite3.connect("subscribers.db", check_same_thread=False)
-c = conn.cursor()
+DB_PATH = "subscribers.db"
 
-c.execute(
-    """
-    CREATE TABLE IF NOT EXISTS subscribers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT UNIQUE
+
+def get_connection():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+
+def init_database():
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS subscribers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL
+        )
+        """
     )
-    """
-)
-conn.commit()
+
+    conn.commit()
+    conn.close()
+
+
+def add_subscriber(email):
+    email = email.strip().lower()
+
+    if not email:
+        return False, "Enter an email address."
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            "INSERT INTO subscribers (email) VALUES (?)",
+            (email,),
+        )
+        conn.commit()
+        return True, "Subscription added."
+    except sqlite3.IntegrityError:
+        return False, "That email is already subscribed."
+    finally:
+        conn.close()
+
+
+def get_subscribers():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT email FROM subscribers ORDER BY id DESC")
+    rows = cursor.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
+init_database()
 
 
 # ============================================================
-# 🧠 SESSION STATE
-# ============================================================
-
-defaults = {
-    "last_sent_time": {
-        "feedstock": 0,
-        "temperature": 0,
-        "pressure": 0,
-    },
-    "alert_log": [],
-    "activity_feed": [],
-    "last_update_id": None,
-    "history": [],
-    "last_reading_signature": None,
-    "feedstock_profile_signature": None,
-}
-
-for key, value in defaults.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
-
-COOLDOWN = 60
-
-
-# ============================================================
-# 🌾 FEEDSTOCK PROFILES
+# FEEDSTOCK PROFILES
+# Prototype assumptions — replace with validated project data
 # ============================================================
 
 FEEDSTOCK_PROFILES = {
     "Starch-based": {
-        "items": ["Corn", "Wheat", "Barley"],
-        "defaults": {
-            "moisture": 65,
-            "cn_ratio": 28,
-            "particle_size": 4,
-            "volatile_solids": 88,
-            "fixed_solids": 12,
-            "energy_content": 17.5,
-        },
-        "factor": 1.0,
-        "methane": 61,
+        "factor": 1.00,
+        "moisture": 0.70,
+        "volatile_solids": 0.80,
+        "cn_ratio": 25,
+        "methane": 55,
     },
     "Sugar-based": {
-        "items": ["Sugarcane", "Sugarcane waste", "Sugar beet"],
-        "defaults": {
-            "moisture": 72,
-            "cn_ratio": 24,
-            "particle_size": 3,
-            "volatile_solids": 90,
-            "fixed_solids": 10,
-            "energy_content": 16.8,
-        },
-        "factor": 1.08,
-        "methane": 64,
+        "factor": 1.05,
+        "moisture": 0.75,
+        "volatile_solids": 0.82,
+        "cn_ratio": 25,
+        "methane": 58,
     },
     "Oil-based": {
-        "items": ["Soybean", "Palm oil", "Used cooking oil"],
-        "defaults": {
-            "moisture": 12,
-            "cn_ratio": 32,
-            "particle_size": 2,
-            "volatile_solids": 94,
-            "fixed_solids": 6,
-            "energy_content": 30.0,
-        },
-        "factor": 1.22,
-        "methane": 68,
-    },
-    "Residue / Waste": {
-        "items": ["Agricultural residues", "Food waste", "Industrial byproducts"],
-        "defaults": {
-            "moisture": 70,
-            "cn_ratio": 22,
-            "particle_size": 5,
-            "volatile_solids": 85,
-            "fixed_solids": 15,
-            "energy_content": 16.0,
-        },
-        "factor": 1.03,
+        "factor": 1.10,
+        "moisture": 0.65,
+        "volatile_solids": 0.88,
+        "cn_ratio": 30,
         "methane": 62,
     },
-    "Lignocellulosic Biomass": {
-        "items": ["Corn stover", "Wood chips", "Switchgrass"],
-        "defaults": {
-            "moisture": 20,
-            "cn_ratio": 45,
-            "particle_size": 8,
-            "volatile_solids": 78,
-            "fixed_solids": 22,
-            "energy_content": 18.5,
-        },
-        "factor": 0.78,
+    "Residue/Waste": {
+        "factor": 0.90,
+        "moisture": 0.65,
+        "volatile_solids": 0.70,
+        "cn_ratio": 30,
         "methane": 52,
     },
-    "Algae": {
-        "items": ["Microalgae species"],
-        "defaults": {
-            "moisture": 82,
-            "cn_ratio": 10,
-            "particle_size": 1,
-            "volatile_solids": 86,
-            "fixed_solids": 14,
-            "energy_content": 19.0,
-        },
-        "factor": 1.12,
-        "methane": 65,
+    "Lignocellulosic Biomass": {
+        "factor": 0.75,
+        "moisture": 0.60,
+        "volatile_solids": 0.65,
+        "cn_ratio": 60,
+        "methane": 48,
     },
-    "Animal / Organic Waste": {
-        "items": [
-            "Cow dung",
-            "Goat dung",
-            "Pig dung",
-            "Poultry droppings",
-            "Human excreta",
-            "Water hyacinth",
-        ],
-        "defaults": {
-            "moisture": 80,
-            "cn_ratio": 18,
-            "particle_size": 8,
-            "volatile_solids": 75,
-            "fixed_solids": 25,
-            "energy_content": 15.0,
-        },
-        "factor": 0.85,
+    "Algae": {
+        "factor": 0.95,
+        "moisture": 0.85,
+        "volatile_solids": 0.75,
+        "cn_ratio": 12,
         "methane": 58,
-        "item_profiles": {
-            "Cow dung": {
-                "moisture": 80, "cn_ratio": 18, "particle_size": 8,
-                "volatile_solids": 75, "fixed_solids": 25,
-                "energy_content": 15.0, "factor": 0.85, "methane": 58,
-            },
-            "Goat dung": {
-                "moisture": 72, "cn_ratio": 16, "particle_size": 8,
-                "volatile_solids": 78, "fixed_solids": 22,
-                "energy_content": 16.0, "factor": 0.90, "methane": 60,
-            },
-            "Pig dung": {
-                "moisture": 82, "cn_ratio": 14, "particle_size": 8,
-                "volatile_solids": 80, "fixed_solids": 20,
-                "energy_content": 16.5, "factor": 0.95, "methane": 61,
-            },
-            "Poultry droppings": {
-                "moisture": 65, "cn_ratio": 10, "particle_size": 5,
-                "volatile_solids": 82, "fixed_solids": 18,
-                "energy_content": 17.5, "factor": 1.10, "methane": 65,
-            },
-            "Human excreta": {
-                "moisture": 78, "cn_ratio": 8, "particle_size": 5,
-                "volatile_solids": 70, "fixed_solids": 30,
-                "energy_content": 14.5, "factor": 0.90, "methane": 57,
-            },
-            "Water hyacinth": {
-                "moisture": 90, "cn_ratio": 25, "particle_size": 8,
-                "volatile_solids": 60, "fixed_solids": 40,
-                "energy_content": 12.0, "factor": 0.65, "methane": 54,
-            },
-        },
+    },
+    "Animal/Organic Waste": {
+        "factor": 0.85,
+        "moisture": 0.78,
+        "volatile_solids": 0.72,
+        "cn_ratio": 22,
+        "methane": 55,
     },
 }
 
-
-# ============================================================
-# 🏭 DIGESTER PROFILES
-# ============================================================
 
 DIGESTER_PROFILES = {
     "Small scale": {
+        "size": 4,
         "range": "2–4 m³",
-        "size": 3,
-        "minimum": 0.8,
-        "maximum": 1.5,
+        "expected": "0.8–1.5 m³/day",
     },
     "Medium": {
+        "size": 10,
         "range": "5–10 m³",
-        "size": 7.5,
-        "minimum": 2.0,
-        "maximum": 3.0,
+        "expected": "2–3 m³/day",
     },
     "Farm scale": {
+        "size": 25,
         "range": "15–25 m³",
-        "size": 20,
-        "minimum": 5.0,
-        "maximum": 8.0,
+        "expected": "5–8 m³/day",
     },
     "Community farm": {
+        "size": 50,
         "range": "30–50 m³",
-        "size": 40,
-        "minimum": 10.0,
-        "maximum": 25.0,
+        "expected": "10–25 m³/day",
     },
     "Industrial": {
-        "range": "100+ m³",
         "size": 100,
-        "minimum": 40.0,
-        "maximum": 80.0,
+        "range": "100+ m³",
+        "expected": "40–80 m³/day",
     },
 }
 
 
-# ============================================================
-# 🔧 HELPERS
-# ============================================================
-
-def log_alert(message):
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    st.session_state.alert_log.append(f"{timestamp} — {message}")
-    st.session_state.alert_log = st.session_state.alert_log[-20:]
-
-
-def log_activity(message):
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    st.session_state.activity_feed.append(f"{timestamp}  |  {message}")
-    st.session_state.activity_feed = st.session_state.activity_feed[-12:]
-
-
-def apply_feedstock_defaults():
-    category = st.session_state.get("feedstock_category", "Residue / Waste")
-    profile = FEEDSTOCK_PROFILES[category]
-    subtype = st.session_state.get("feedstock_subtype")
-
-    defaults_for_type = profile.get("item_profiles", {}).get(
-        subtype,
-        profile["defaults"],
-    )
-
-    for property_name, value in defaults_for_type.items():
-        if property_name not in {"factor", "methane"}:
-            st.session_state[f"feedstock_{property_name}"] = value
-
-
-def get_feedstock_profile(category, subtype, properties):
-    category_profile = FEEDSTOCK_PROFILES[category]
-
-    profile = category_profile.get("item_profiles", {}).get(
-        subtype,
-        category_profile,
+def get_feedstock_profile(feedstock_type):
+    profile = FEEDSTOCK_PROFILES.get(
+        feedstock_type,
+        FEEDSTOCK_PROFILES["Animal/Organic Waste"],
     )
 
     normalized = {
-        "moisture": max(0, min(100, properties["moisture"])) / 100,
-        "cn_ratio": max(0, min(60, properties["cn_ratio"])) / 60,
-        "particle_size": max(0, min(20, properties["particle_size"])) / 20,
-        "volatile_solids": max(0, min(100, properties["volatile_solids"])) / 100,
-        "fixed_solids": max(0, min(100, properties["fixed_solids"])) / 100,
-        "energy_content": max(0, min(40, properties["energy_content"])) / 40,
+        "moisture": profile["moisture"],
+        "volatile_solids": profile["volatile_solids"],
+        "cn_ratio": min(max(profile["cn_ratio"] / 30, 0), 1),
     }
-
-    category_encoding = {
-        name: int(name == category)
-        for name in FEEDSTOCK_PROFILES
-    }
-
-    suitability = round(
-        max(
-            0,
-            min(
-                100,
-                (normalized["volatile_solids"] * 45)
-                + (normalized["energy_content"] * 25)
-                + ((1 - abs(normalized["cn_ratio"] - 0.37)) * 30),
-            ),
-        )
-    )
 
     return {
-        "category": category,
-        "subtype": subtype,
-        "category_encoding": category_encoding,
+        **profile,
         "normalized": normalized,
-        "suitability": suitability,
-        "factor": profile["factor"],
-        "methane": profile["methane"],
     }
 
 
-def get_digester_metrics(digester_category, prediction):
-    profile = DIGESTER_PROFILES[digester_category]
-
-    utilization = round((prediction / profile["maximum"]) * 100)
-
-    return {
-        "category": digester_category,
-        "range": profile["range"],
-        "minimum": profile["minimum"],
-        "maximum": profile["maximum"],
-        "size": profile["size"],
-        "utilization": max(0, utilization),
-        "within_range": profile["minimum"] <= prediction <= profile["maximum"],
-    }
-
+# ============================================================
+# FORECASTING / METRICS
+# Prototype model — not a validated engineering model
+# ============================================================
 
 def predict_biogas(
     feedstock,
@@ -379,18 +241,19 @@ def predict_biogas(
     digester_profile=None,
     pressure=None,
 ):
-    efficiency = 0.8 if 30 <= temperature <= 40 else 0.5
+    efficiency = 0.80 if 30 <= temperature <= 40 else 0.50
     base_prediction = feedstock * efficiency
 
     if feedstock_profile is None:
-        return base_prediction
+        return max(base_prediction, 0)
 
     moisture_factor = (
-        1 - abs(feedstock_profile["normalized"]["moisture"] - 0.7) * 0.18
+        1 - abs(feedstock_profile["normalized"]["moisture"] - 0.70) * 0.18
     )
 
     solids_factor = (
-        0.85 + (feedstock_profile["normalized"]["volatile_solids"] * 0.2)
+        0.85
+        + feedstock_profile["normalized"]["volatile_solids"] * 0.20
     )
 
     forecast = (
@@ -409,317 +272,224 @@ def predict_biogas(
             1 - abs(110 - pressure) * 0.002,
         )
 
-    return forecast
+    return max(forecast, 0)
 
 
-def calculate_dashboard_metrics(
+def calculate_metrics(
     feedstock,
     temperature,
     pressure,
-    prediction,
-    feedstock_profile=None,
+    feedstock_profile,
+    digester_profile,
 ):
-    temperature_stability = max(
+    daily_output = predict_biogas(
+        feedstock=feedstock,
+        temperature=temperature,
+        feedstock_profile=feedstock_profile,
+        digester_profile=digester_profile,
+        pressure=pressure,
+    )
+
+    monthly_output = daily_output * 30
+    methane_percentage = feedstock_profile["methane"]
+    co2_reduction = monthly_output * 1.8
+    energy_value = daily_output * 6.0
+
+    temperature_score = max(
         0,
-        100 - abs(37 - temperature) * 4,
+        100 - abs(37 - temperature) * 5,
     )
 
-    pressure_stability = max(
+    pressure_score = max(
         0,
-        100 - abs(110 - pressure) * 0.8,
+        100 - abs(110 - pressure) * 1.2,
     )
 
-    suitability = (
-        feedstock_profile["suitability"]
-        if feedstock_profile
-        else 75
-    )
-
-    efficiency_score = round(
-        (temperature_stability * 0.55)
-        + (pressure_stability * 0.3)
-        + (suitability * 0.15)
-    )
-
-    operational_stability = round(
-        (temperature_stability + pressure_stability + feedstock) / 3
+    efficiency_score = (
+        temperature_score * 0.6
+        + pressure_score * 0.4
     )
 
     return {
-        "daily_output": prediction,
-        "monthly_output": prediction * 30,
-        "co2_reduction": prediction * 1.8,
-        "energy_savings": prediction * 0.6,
-        "efficiency_score": min(100, efficiency_score),
-        "operational_stability": min(
-            100,
-            round(operational_stability),
-        ),
-        "methane_percentage": (
-            feedstock_profile["methane"]
-            if feedstock_profile
-            else 60
-        ),
-        "feedstock_suitability": suitability,
+        "daily_output": daily_output,
+        "monthly_output": monthly_output,
+        "co2_reduction": co2_reduction,
+        "energy_value": energy_value,
+        "methane_percentage": methane_percentage,
+        "efficiency_score": efficiency_score,
     }
 
 
-def get_ai_insight(
-    feedstock,
-    temperature,
-    pressure,
-    metrics,
-    feedstock_profile=None,
-):
-    if feedstock < 20:
-        return (
-            "HIGH",
-            "Low substrate availability detected.",
-            "Review feedstock supply",
-        )
+# ============================================================
+# ALERTS
+# ============================================================
 
-    if temperature < 30 or temperature > 40:
-        return (
-            "MEDIUM",
-            "Temperature drift detected.",
-            "Monitor thermal stability",
-        )
+COOLDOWN = 60
 
-    if pressure < 90 or pressure > 180:
-        return (
-            "MEDIUM",
-            "Pressure outside the configured monitoring range.",
-            "Review pressure conditions",
-        )
 
-    if feedstock_profile and feedstock_profile["category"] == "Oil-based":
-        return (
-            "LOW",
-            "Oil-rich feedstock profile selected.",
-            "Monitor loading conditions",
-        )
+def log_activity(message):
+    st.session_state.activity_feed.insert(
+        0,
+        {
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "message": message,
+        },
+    )
 
-    if metrics["efficiency_score"] >= 85:
-        return (
-            "LOW",
-            "Current monitored conditions are stable.",
-            "Continue monitoring",
-        )
-
-    return (
-        "MEDIUM",
-        "Operating conditions are usable but should be monitored.",
-        "Monitor next refresh",
+    st.session_state.activity_feed = (
+        st.session_state.activity_feed[:20]
     )
 
 
-# ============================================================
-# 📧 BREVO
-# ============================================================
-
 def send_email_alert(subject, body, receiver):
-    if not BREVO_API_KEY or not EMAIL_SENDER:
-        return False
+    if not BREVO_API_KEY or not EMAIL_SENDER or not receiver:
+        return False, "Brevo configuration is missing."
+
+    url = "https://api.brevo.com/v3/smtp/email"
+
+    headers = {
+        "accept": "application/json",
+        "api-key": BREVO_API_KEY,
+        "content-type": "application/json",
+    }
+
+    payload = {
+        "sender": {
+            "name": "Hexnn Smart Biogas",
+            "email": EMAIL_SENDER,
+        },
+        "to": [{"email": receiver}],
+        "subject": subject,
+        "htmlContent": f"""
+        <div style="font-family:Arial,sans-serif;">
+            <h2>🌱 Hexnn Smart Biogas Alert</h2>
+            <p>{body}</p>
+            <hr>
+            <p>Hexnn Energy Solutions</p>
+        </div>
+        """,
+    }
 
     try:
-        configuration = sib_api_v3_sdk.Configuration()
-        configuration.api_key["api-key"] = BREVO_API_KEY
-
-        api_instance = sib_api_v3_sdk.TransactionalEmailsApi(
-            sib_api_v3_sdk.ApiClient(configuration)
-        )
-
-        email = sib_api_v3_sdk.SendSmtpEmail(
-            to=[{"email": receiver}],
-            subject=subject,
-            html_content=f"""
-                <html>
-                    <body style="font-family:Arial,sans-serif;">
-                        <h2>🌱 Hexnn Smart Biogas Alert</h2>
-                        <h3>{subject}</h3>
-                        <p>{body}</p>
-                        <hr>
-                        <small>Hexnn Energy Solutions</small>
-                    </body>
-                </html>
-            """,
-            sender={"email": EMAIL_SENDER},
-        )
-
-        api_instance.send_transac_email(email)
-        return True
-
-    except ApiException as exc:
-        print("Brevo error:", exc)
-        return False
-
-    except Exception as exc:
-        print("Email error:", exc)
-        return False
-
-
-# ============================================================
-# 📱 TELEGRAM
-# ============================================================
-
-def send_telegram_message(chat_id, message):
-    if not TELEGRAM_BOT_TOKEN or not chat_id:
-        return False
-
-    try:
-        url = (
-            f"https://api.telegram.org/bot"
-            f"{TELEGRAM_BOT_TOKEN}/sendMessage"
-        )
-
         response = requests.post(
             url,
-            data={
-                "chat_id": chat_id,
-                "text": message,
-            },
-            timeout=10,
+            headers=headers,
+            json=payload,
+            timeout=20,
         )
 
-        response.raise_for_status()
-        return True
+        if response.ok:
+            return True, "Email sent."
 
-    except Exception as exc:
-        print("Telegram error:", exc)
-        return False
+        return False, f"Brevo HTTP {response.status_code}"
+
+    except requests.RequestException as exc:
+        return False, f"Email request failed: {exc}"
 
 
-def check_telegram_commands(feedstock, temperature, pressure):
-    if not TELEGRAM_BOT_TOKEN:
-        return
+def send_telegram_message(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False, "Telegram configuration is missing."
+
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+    }
 
     try:
-        url = (
-            f"https://api.telegram.org/bot"
-            f"{TELEGRAM_BOT_TOKEN}/getUpdates"
+        response = requests.post(
+            url,
+            data=payload,
+            timeout=20,
         )
 
-        params = {}
+        if response.ok:
+            return True, "Telegram sent."
 
-        if st.session_state.last_update_id is not None:
-            params["offset"] = (
-                st.session_state.last_update_id + 1
-            )
+        return False, f"Telegram HTTP {response.status_code}"
 
-        response = requests.get(
-            url,
-            params=params,
-            timeout=10,
-        ).json()
-
-        if response.get("ok"):
-            for update in response.get("result", []):
-                st.session_state.last_update_id = update["update_id"]
-
-                if "message" not in update:
-                    continue
-
-                chat_id = update["message"]["chat"]["id"]
-
-                text = update["message"].get(
-                    "text",
-                    "",
-                ).lower().strip()
-
-                if "status" in text:
-                    log_activity(
-                        "Telegram status command received"
-                    )
-
-                    reply = (
-                        "📊 HEXNN SMART BIOGAS STATUS\n\n"
-                        f"Feedstock: {feedstock}%\n"
-                        f"Temperature: {temperature}°C\n"
-                        f"Pressure: {pressure} kPa"
-                    )
-
-                    send_telegram_message(
-                        chat_id,
-                        reply,
-                    )
-
-                elif "predict" in text:
-                    log_activity(
-                        "Telegram forecast command received"
-                    )
-
-                    predicted = predict_biogas(
-                        feedstock,
-                        temperature,
-                    )
-
-                    send_telegram_message(
-                        chat_id,
-                        f"🔮 Prototype forecast: "
-                        f"{predicted:.2f} m³/day",
-                    )
-
-                elif "help" in text:
-                    log_activity(
-                        "Telegram help command received"
-                    )
-
-                    send_telegram_message(
-                        chat_id,
-                        "Commands:\n"
-                        "• status\n"
-                        "• predict\n"
-                        "• help",
-                    )
-
-    except Exception as exc:
-        print("Telegram read error:", exc)
+    except requests.RequestException as exc:
+        return False, f"Telegram request failed: {exc}"
 
 
-# ============================================================
-# 🚨 ALERTS
-# ============================================================
+def handle_alert(alert_key, subject, body):
+    now = time.time()
 
-def handle_alert(condition, key, subject, message):
-    if not condition:
+    last_time = st.session_state.last_sent_time.get(
+        alert_key,
+        0,
+    )
+
+    if now - last_time < COOLDOWN:
         return
 
-    current_time = time.time()
+    st.session_state.last_sent_time[alert_key] = now
 
-    if (
-        current_time
-        - st.session_state.last_sent_time[key]
-        > COOLDOWN
-    ):
-        c.execute(
-            "SELECT DISTINCT email FROM subscribers"
+    recipients = get_subscribers()
+
+    for email in recipients:
+        send_email_alert(
+            subject=subject,
+            body=body,
+            receiver=email,
         )
 
-        for (email,) in c.fetchall():
-            send_email_alert(
-                subject,
-                message,
-                email,
-            )
+    send_telegram_message(
+        f"🌱 HEXNN SMART BIOGAS ALERT\n\n"
+        f"{subject}\n\n"
+        f"{body}"
+    )
 
-        send_telegram_message(
-            TELEGRAM_CHAT_ID,
-            f"{subject}\n{message}",
-        )
+    st.session_state.alert_log.insert(
+        0,
+        {
+            "time": datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+            "subject": subject,
+            "body": body,
+        },
+    )
 
-        log_alert(
-            f"{subject} — {message}"
-        )
+    st.session_state.alert_log = (
+        st.session_state.alert_log[:20]
+    )
 
-        log_activity(
-            f"Alert triggered: {subject}"
-        )
-
-        st.session_state.last_sent_time[key] = current_time
+    log_activity(subject)
 
 
 # ============================================================
-# 🎨 VISUAL SYSTEM
+# SYSTEM STATUS
+# ============================================================
+
+def get_system_status(feedstock, temperature, pressure):
+    problems = []
+
+    if feedstock < 20:
+        problems.append("Low feedstock")
+
+    if temperature < 25 or temperature > 65:
+        problems.append("Temperature outside alert range")
+
+    if pressure < 90 or pressure > 180:
+        problems.append("Pressure outside alert range")
+
+    if not problems:
+        return "OPTIMAL", "System operating within prototype thresholds."
+
+    if len(problems) == 1:
+        return "ATTENTION", problems[0]
+
+    return "ALERT", " | ".join(problems)
+
+
+# ============================================================
+# VISUAL STYLE
 # ============================================================
 
 st.markdown(
@@ -727,200 +497,82 @@ st.markdown(
     <style>
     .stApp {
         background:
-            radial-gradient(circle at 10% 0%, #164f40 0%, transparent 28%),
-            radial-gradient(circle at 90% 15%, #0b4437 0%, transparent 25%),
-            linear-gradient(145deg, #06130f 0%, #071a15 48%, #04100d 100%);
-        color: #ecfff8;
+            radial-gradient(
+                circle at top right,
+                rgba(0, 120, 90, 0.18),
+                transparent 35%
+            ),
+            #07130f;
+        color: #eaf7f1;
     }
 
-    [data-testid="stHeader"] {
-        background: rgba(0,0,0,0);
+    section[data-testid="stSidebar"] {
+        background: #071a14;
+        border-right: 1px solid rgba(80, 180, 140, 0.18);
     }
 
-    .main .block-container {
-        max-width: 1450px;
-        padding-top: 1.4rem;
+    .block-container {
+        padding-top: 1rem;
         padding-bottom: 2rem;
+        max-width: 1500px;
     }
 
-    [data-testid="stSidebar"] {
-        background:
-            linear-gradient(180deg, #0a2d25 0%, #061914 100%);
-        border-right: 1px solid rgba(93,255,194,.15);
+    .hero {
+        padding: 18px 20px;
+        border-radius: 18px;
+        background: rgba(12, 37, 29, 0.82);
+        border: 1px solid rgba(88, 190, 150, 0.18);
+        margin-bottom: 14px;
     }
 
-    [data-testid="stSidebar"] * {
-        color: #d8f8ed;
+    .hero h1 {
+        margin: 0;
+        font-size: 30px;
     }
 
-    .topbar {
-        display:flex;
-        justify-content:space-between;
-        align-items:center;
-        padding:.55rem 1rem;
-        margin-bottom:1rem;
-        border-bottom:1px solid rgba(100,255,200,.14);
-        color:#dffcf1;
-        font-weight:700;
-    }
-
-    .brand {
-        color:#70efbd;
-        font-size:1rem;
-        letter-spacing:.02em;
-    }
-
-    .dashboard-title {
-        font-size:1.55rem;
-        font-weight:800;
-        color:#f0fff9;
-        margin:.2rem 0 .15rem;
-    }
-
-    .dashboard-subtitle {
-        color:#83b7aa;
-        font-size:.8rem;
-        margin-bottom:1rem;
+    .hero p {
+        margin: 5px 0 0;
+        color: #8fb7a8;
     }
 
     .metric-card {
-        min-height:108px;
-        padding:1rem 1.05rem;
-        border-radius:10px;
-        border:1px solid rgba(101,255,197,.18);
-        background:
-            linear-gradient(145deg,
-            rgba(23,83,67,.82),
-            rgba(5,31,25,.88));
-        box-shadow:
-            inset 0 1px 0 rgba(255,255,255,.025),
-            0 10px 30px rgba(0,0,0,.18);
-    }
-
-    .metric-card.alert {
-        background:
-            linear-gradient(145deg,
-            rgba(135,38,55,.94),
-            rgba(74,18,29,.92));
-        border-color:rgba(255,103,124,.38);
-    }
-
-    .metric-card.warning {
-        background:
-            linear-gradient(145deg,
-            rgba(137,104,19,.95),
-            rgba(75,53,8,.92));
-        border-color:rgba(255,205,73,.4);
+        padding: 16px;
+        border-radius: 16px;
+        background: rgba(12, 35, 28, 0.90);
+        border: 1px solid rgba(95, 190, 150, 0.16);
+        min-height: 125px;
     }
 
     .metric-label {
-        color:#86b7aa;
-        font-size:.72rem;
-        font-weight:700;
-        margin-bottom:.4rem;
+        color: #8eb4a5;
+        font-size: 13px;
     }
 
     .metric-value {
-        color:#f4fffb;
-        font-size:1.55rem;
-        line-height:1;
-        font-weight:800;
+        font-size: 28px;
+        font-weight: 700;
+        margin-top: 6px;
     }
 
-    .metric-caption {
-        color:#6fa798;
-        font-size:.66rem;
-        margin-top:.45rem;
+    .metric-sub {
+        color: #6fa58f;
+        font-size: 12px;
+        margin-top: 4px;
     }
 
-    .section-title {
-        color:#dffcf2;
-        font-size:.82rem;
-        font-weight:800;
-        letter-spacing:.06em;
-        text-transform:uppercase;
-        margin:1.15rem 0 .55rem;
-    }
-
-    .chart-panel {
-        background:
-            linear-gradient(145deg,
-            rgba(15,61,49,.78),
-            rgba(4,24,19,.82));
-        border:1px solid rgba(89,255,194,.15);
-        border-radius:10px;
-        padding:.5rem .7rem .1rem;
-        box-shadow:0 12px 35px rgba(0,0,0,.16);
-    }
-
-    .mini-card {
-        background:rgba(11,45,37,.7);
-        border:1px solid rgba(90,255,194,.15);
-        border-radius:9px;
-        padding:.8rem;
-        margin-bottom:.55rem;
-    }
-
-    .mini-label {
-        color:#78ad9e;
-        font-size:.68rem;
-        text-transform:uppercase;
-        letter-spacing:.05em;
-    }
-
-    .mini-value {
-        color:#effff9;
-        font-size:1.05rem;
-        font-weight:800;
-        margin-top:.2rem;
-    }
-
-    .status-online {
-        color:#58f0b5;
-        font-weight:800;
-    }
-
-    .status-monitor {
-        color:#ffd75d;
-        font-weight:800;
-    }
-
-    .status-danger {
-        color:#ff7185;
-        font-weight:800;
-    }
-
-    .activity {
-        max-height:145px;
-        overflow-y:auto;
-        font-family:Consolas,monospace;
-        color:#9bcbbd;
-        font-size:.72rem;
-        line-height:1.9;
-    }
-
-    .footer-mark {
-        text-align:center;
-        color:#547f73;
-        font-size:.68rem;
-        letter-spacing:.08em;
-        padding:1.5rem 0 .5rem;
+    .panel {
+        padding: 14px 16px;
+        border-radius: 16px;
+        background: rgba(10, 31, 24, 0.82);
+        border: 1px solid rgba(95, 190, 150, 0.13);
+        margin-bottom: 14px;
     }
 
     div[data-testid="stMetric"] {
-        background:rgba(10,47,38,.7);
-        border:1px solid rgba(83,255,193,.16);
-        border-radius:9px;
-    }
-
-    .stButton > button {
-        border-radius:7px;
-    }
-
-    @media (max-width: 900px) {
-        .dashboard-title {
-            font-size:1.25rem;
-        }
+        background: rgba(12, 35, 28, 0.90);
+        border: 1px solid rgba(95, 190, 150, 0.16);
+        padding: 12px;
+        border-radius: 16px;
     }
     </style>
     """,
@@ -929,949 +581,555 @@ st.markdown(
 
 
 # ============================================================
-# 🧭 SIDEBAR
+# SIDEBAR CONTROLS
 # ============================================================
 
 with st.sidebar:
-    st.markdown(
-        """
-        <div style="
-            font-size:1.05rem;
-            font-weight:800;
-            color:#7af0bf;
-            margin-bottom:1.2rem;">
-            🌱 HEXNN
-        </div>
-        """,
-        unsafe_allow_html=True,
+    st.markdown("## 🌱 HEXNN")
+    st.caption("Smart Biogas Monitoring")
+
+    st.markdown("---")
+
+    feedstock_type = st.selectbox(
+        "Feedstock",
+        list(FEEDSTOCK_PROFILES.keys()),
+        index=6,
     )
 
-    st.markdown("### SYSTEM")
-    st.caption("● Online monitoring")
-    st.caption("● AI forecast layer")
-    st.caption("● Alert services")
-
-    st.markdown("### NAVIGATION")
-    page = st.radio(
-        "",
-        [
-            "Dashboard",
-            "Controls",
-            "Alerts & Subscribe",
-        ],
-        label_visibility="collapsed",
+    digester_type = st.selectbox(
+        "Digester profile",
+        list(DIGESTER_PROFILES.keys()),
+        index=1,
     )
 
-    st.divider()
-
-    st.caption("HEXNN ENERGY SOLUTIONS")
-    st.caption("Smart Biogas System")
-    st.caption("Uganda 🇺🇬")
-
-
-# ============================================================
-# 🎛️ INPUTS
-# ============================================================
-
-if "feedstock_category" not in st.session_state:
-    st.session_state.feedstock_category = "Residue / Waste"
-
-if "feedstock_subtype" not in st.session_state:
-    st.session_state.feedstock_subtype = (
-        FEEDSTOCK_PROFILES["Residue / Waste"]["items"][0]
-    )
-
-apply_feedstock_defaults()
-
-if page == "Controls":
-    st.markdown(
-        '<div class="dashboard-title">System Controls</div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown("---")
 
     feedstock = st.slider(
         "Feedstock level (%)",
-        0,
-        100,
-        75,
-        key="feedstock_control",
+        min_value=0,
+        max_value=100,
+        value=75,
     )
 
     temperature = st.slider(
         "Temperature (°C)",
-        20,
-        80,
-        37,
-        key="temperature_control",
+        min_value=0,
+        max_value=80,
+        value=37,
     )
 
     pressure = st.slider(
-        "Pressure (kPa)",
-        80,
-        200,
-        110,
-        key="pressure_control",
+        "Gas pressure (kPa)",
+        min_value=0,
+        max_value=250,
+        value=110,
     )
 
-else:
-    feedstock = st.slider(
-        "Feedstock level (%)",
-        0,
-        100,
-        75,
-        key="feedstock_dashboard",
-        label_visibility="collapsed",
-    )
-
-    temperature = st.slider(
-        "Temperature (°C)",
-        20,
-        80,
-        37,
-        key="temperature_dashboard",
-        label_visibility="collapsed",
-    )
-
-    pressure = st.slider(
-        "Pressure (kPa)",
-        80,
-        200,
-        110,
-        key="pressure_dashboard",
-        label_visibility="collapsed",
-    )
-
-
-# ============================================================
-# 🌾 FEEDSTOCK PROFILE
-# ============================================================
-
-category = st.session_state.feedstock_category
-subtype = st.session_state.feedstock_subtype
-
-with st.expander("🌾 Feedstock Intelligence", expanded=False):
-    category = st.selectbox(
-        "Feedstock category",
-        list(FEEDSTOCK_PROFILES),
-        key="feedstock_category",
-        on_change=apply_feedstock_defaults,
-    )
-
-    subtype = st.selectbox(
-        "Feedstock type",
-        FEEDSTOCK_PROFILES[category]["items"],
-        key="feedstock_subtype",
-        on_change=apply_feedstock_defaults,
-    )
-
-    signature = (category, subtype)
-
-    if st.session_state.feedstock_profile_signature != signature:
-        apply_feedstock_defaults()
-        st.session_state.feedstock_profile_signature = signature
-
-    cols = st.columns(3)
-
-    with cols[0]:
-        moisture = st.number_input(
-            "Moisture (%)",
-            0.0,
-            100.0,
-            key="feedstock_moisture",
-        )
-
-        cn_ratio = st.number_input(
-            "C/N ratio",
-            1.0,
-            100.0,
-            key="feedstock_cn_ratio",
-        )
-
-    with cols[1]:
-        particle_size = st.number_input(
-            "Particle size (mm)",
-            0.1,
-            50.0,
-            key="feedstock_particle_size",
-        )
-
-        volatile_solids = st.number_input(
-            "Volatile solids (%)",
-            0.0,
-            100.0,
-            key="feedstock_volatile_solids",
-        )
-
-    with cols[2]:
-        fixed_solids = st.number_input(
-            "Fixed solids (%)",
-            0.0,
-            100.0,
-            key="feedstock_fixed_solids",
-        )
-
-        energy_content = st.number_input(
-            "Energy content",
-            0.0,
-            50.0,
-            key="feedstock_energy_content",
-        )
-
-feedstock_properties = {
-    "moisture": moisture,
-    "cn_ratio": cn_ratio,
-    "particle_size": particle_size,
-    "volatile_solids": volatile_solids,
-    "fixed_solids": fixed_solids,
-    "energy_content": energy_content,
-}
-
-feedstock_profile = get_feedstock_profile(
-    category,
-    subtype,
-    feedstock_properties,
-)
-
-
-# ============================================================
-# 🏭 DIGESTER
-# ============================================================
-
-with st.expander("🏭 Biodigester Capacity Intelligence", expanded=False):
-    digester_category = st.selectbox(
-        "Capacity class",
-        list(DIGESTER_PROFILES),
-        key="digester_category",
-    )
-
-    digester_profile = DIGESTER_PROFILES[digester_category]
-
+    st.markdown("---")
     st.caption(
-        f"{digester_profile['range']} • "
-        f"{digester_profile['minimum']:.1f}–"
-        f"{digester_profile['maximum']:.1f} m³/day prototype range"
+        "Prototype monitoring controls. "
+        "Connect validated sensors before operational use."
     )
 
-if "digester_category" not in st.session_state:
-    digester_category = "Small scale"
-    digester_profile = DIGESTER_PROFILES[digester_category]
-else:
-    digester_category = st.session_state.digester_category
-    digester_profile = DIGESTER_PROFILES[digester_category]
+
+# ============================================================
+# CALCULATIONS
+# ============================================================
+
+feedstock_profile = get_feedstock_profile(feedstock_type)
+digester_profile = DIGESTER_PROFILES[digester_type]
+
+metrics = calculate_metrics(
+    feedstock=feedstock,
+    temperature=temperature,
+    pressure=pressure,
+    feedstock_profile=feedstock_profile,
+    digester_profile=digester_profile,
+)
+
+status, status_message = get_system_status(
+    feedstock,
+    temperature,
+    pressure,
+)
 
 
 # ============================================================
-# 🤖 CALCULATIONS
+# AUTOMATIC ALERTS
 # ============================================================
 
-prediction = predict_biogas(
-    feedstock,
-    temperature,
-    feedstock_profile,
-    digester_profile,
-    pressure,
-)
-
-digester_metrics = get_digester_metrics(
-    digester_category,
-    prediction,
-)
-
-metrics = calculate_dashboard_metrics(
-    feedstock,
-    temperature,
-    pressure,
-    prediction,
-    feedstock_profile,
-)
-
-risk_level, commentary, recommended_action = get_ai_insight(
-    feedstock,
-    temperature,
-    pressure,
-    metrics,
-    feedstock_profile,
-)
-
-system_stable = (
-    feedstock >= 20
-    and 25 <= temperature <= 65
-    and 90 <= pressure <= 180
-)
-
-ai_health = (
-    "HEALTHY"
-    if metrics["efficiency_score"] >= 70
-    and risk_level == "LOW"
-    else "MONITORING"
-)
-
-reading_signature = (
-    feedstock,
-    temperature,
-    pressure,
-    subtype,
-    digester_category,
-)
-
-if (
-    st.session_state.last_reading_signature
-    != reading_signature
-):
-    log_activity(
-        "Monitoring values refreshed"
+if feedstock < 20:
+    handle_alert(
+        "low_feedstock",
+        "Low Feedstock Level",
+        f"Feedstock level is {feedstock}%.",
     )
-    st.session_state.last_reading_signature = reading_signature
+
+if temperature < 25 or temperature > 65:
+    handle_alert(
+        "temperature_alert",
+        "Temperature Alert",
+        f"Digester temperature is {temperature} °C.",
+    )
+
+if pressure < 90 or pressure > 180:
+    handle_alert(
+        "pressure_alert",
+        "Gas Pressure Alert",
+        f"Gas pressure is {pressure} kPa.",
+    )
 
 
 # ============================================================
-# 📡 TELEGRAM
+# HEADER
 # ============================================================
 
-check_telegram_commands(
-    feedstock,
-    temperature,
-    pressure,
+st.markdown(
+    f"""
+    <div class="hero">
+        <h1>🌱 Hexnn Smart Biogas Monitoring</h1>
+        <p>
+            Real-time prototype monitoring · AI-assisted forecasting ·
+            Feedstock intelligence
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
 
 # ============================================================
-# 🚨 ALERTS
+# KPI CARDS
 # ============================================================
 
-handle_alert(
-    feedstock < 20,
-    "feedstock",
-    "Feedstock Alert",
-    f"Low feedstock level: {feedstock}%",
-)
+k1, k2, k3, k4, k5 = st.columns(5)
 
-handle_alert(
-    temperature < 25 or temperature > 65,
-    "temperature",
-    "Temperature Alert",
-    f"Temperature: {temperature}°C",
-)
-
-handle_alert(
-    pressure < 90 or pressure > 180,
-    "pressure",
-    "Pressure Alert",
-    f"Pressure: {pressure} kPa",
-)
-
-
-# ============================================================
-# 📊 DASHBOARD
-# ============================================================
-
-if page == "Dashboard":
-
+with k1:
     st.markdown(
-        """
-        <div class="topbar">
-            <div class="brand">🌱 Hexnn Smart Biogas</div>
-            <div>● LIVE MONITORING</div>
-        </div>
-
-        <div class="dashboard-title">
-            Biogas Monitoring System
-        </div>
-
-        <div class="dashboard-subtitle">
-            Real-time operational intelligence • Feedstock • Digester • Energy
+        f"""
+        <div class="metric-card">
+            <div class="metric-label">SYSTEM STATUS</div>
+            <div class="metric-value">{status}</div>
+            <div class="metric-sub">{status_message}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    # -------------------------
-    # TOP STATUS CARDS
-    # -------------------------
-
-    top = st.columns(4)
-
-    with top[0]:
-        st.markdown(
-            f"""
-            <div class="metric-card {'alert' if metrics['methane_percentage'] < 50 else ''}">
-                <div class="metric-label">METHANE PROFILE</div>
-                <div class="metric-value">
-                    {metrics['methane_percentage']}%
-                </div>
-                <div class="metric-caption">CH₄ concentration estimate</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with top[1]:
-        ph_proxy = max(
-            5.5,
-            min(
-                8.5,
-                7.0
-                + ((temperature - 37) * 0.025),
-            ),
-        )
-
-        st.markdown(
-            f"""
-            <div class="metric-card">
-                <div class="metric-label">DIGESTER CONDITION</div>
-                <div class="metric-value">
-                    {ph_proxy:.2f}
-                </div>
-                <div class="metric-caption">
-                    indicative dashboard index
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with top[2]:
-        st.markdown(
-            f"""
-            <div class="metric-card">
-                <div class="metric-label">TEMPERATURE</div>
-                <div class="metric-value">
-                    {temperature:.1f}°C
-                </div>
-                <div class="metric-caption">current reading</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with top[3]:
-        st.markdown(
-            f"""
-            <div class="metric-card">
-                <div class="metric-label">FEEDSTOCK LEVEL</div>
-                <div class="metric-value">
-                    {feedstock}%
-                </div>
-                <div class="metric-caption">{subtype}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    # -------------------------
-    # SECONDARY METRICS
-    # -------------------------
-
-    left, right = st.columns([1, 1.65])
-
-    with left:
-
-        st.markdown(
-            '<div class="section-title">Live sensor intelligence</div>',
-            unsafe_allow_html=True,
-        )
-
-        sensor_cards = [
-            (
-                "🔥 CH₄",
-                f"{metrics['methane_percentage']}%",
-                "methane profile",
-            ),
-            (
-                "🌡 Temperature",
-                f"{temperature:.1f}°C",
-                "reactor temperature",
-            ),
-            (
-                "💨 Pressure",
-                f"{pressure:.0f} kPa",
-                "gas pressure",
-            ),
-            (
-                "📦 Feedstock",
-                f"{feedstock}%",
-                "available level",
-            ),
-        ]
-
-        for icon, value, label in sensor_cards:
-            st.markdown(
-                f"""
-                <div class="mini-card">
-                    <div class="mini-label">{icon} {label}</div>
-                    <div class="mini-value">{value}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-    with right:
-
-        st.markdown(
-            '<div class="section-title">Production outlook</div>',
-            unsafe_allow_html=True,
-        )
-
-        # Build lightweight visual history for the current session.
-        if not st.session_state.history:
-            for i in range(7):
-                simulated = max(
-                    0.1,
-                    prediction * (
-                        0.88
-                        + (i * 0.018)
-                    ),
-                )
-                st.session_state.history.append(
-                    {
-                        "period": i,
-                        "output": simulated,
-                        "temperature": temperature,
-                        "pressure": pressure,
-                    }
-                )
-
-        current_history = st.session_state.history[-7:]
-
-        chart_df = pd.DataFrame(current_history)
-
-        fig = go.Figure()
-
-        fig.add_trace(
-            go.Bar(
-                x=[
-                    "−6",
-                    "−5",
-                    "−4",
-                    "−3",
-                    "−2",
-                    "−1",
-                    "Now",
-                ][-len(chart_df):],
-                y=chart_df["output"],
-                name="Gas output",
-                marker_color="#effff8",
-                opacity=0.95,
-            )
-        )
-
-        fig.update_layout(
-            height=245,
-            margin=dict(l=20, r=15, t=15, b=20),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(color="#9ac5b8", size=10),
-            showlegend=False,
-            xaxis=dict(
-                showgrid=False,
-                zeroline=False,
-            ),
-            yaxis=dict(
-                showgrid=True,
-                gridcolor="rgba(100,255,200,.08)",
-                zeroline=False,
-                title="m³/day",
-            ),
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True,
-            config={"displayModeBar": False},
-        )
-
-    # -------------------------
-    # TREND PANEL
-    # -------------------------
-
+with k2:
     st.markdown(
-        '<div class="section-title">Operational trends</div>',
+        f"""
+        <div class="metric-card">
+            <div class="metric-label">CH₄ ESTIMATE</div>
+            <div class="metric-value">
+                {metrics["methane_percentage"]:.0f}%
+            </div>
+            <div class="metric-sub">
+                prototype feedstock estimate
+            </div>
+        </div>
+        """,
         unsafe_allow_html=True,
     )
 
-    trend_col, health_col = st.columns([1.65, 1])
+with k3:
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="metric-label">TEMPERATURE</div>
+            <div class="metric-value">{temperature} °C</div>
+            <div class="metric-sub">
+                target reference ≈ 37 °C
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    with trend_col:
+with k4:
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="metric-label">GAS PRESSURE</div>
+            <div class="metric-value">{pressure} kPa</div>
+            <div class="metric-sub">
+                current prototype reading
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-        trend_df = pd.DataFrame(
-            {
-                "Reading": [
-                    "−6",
-                    "−5",
-                    "−4",
-                    "−3",
-                    "−2",
-                    "−1",
-                    "Now",
+with k5:
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="metric-label">FORECAST</div>
+            <div class="metric-value">
+                {metrics["daily_output"]:.2f}
+            </div>
+            <div class="metric-sub">
+                m³/day prototype estimate
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ============================================================
+# MAIN MONITORING VISUALS
+# ============================================================
+
+left, right = st.columns([1.45, 1])
+
+with left:
+    st.markdown("### Live Process Monitor")
+
+    temperature_fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=temperature,
+            title={"text": "Temperature °C"},
+            gauge={
+                "axis": {"range": [0, 80]},
+                "bar": {"color": "#39c98a"},
+                "steps": [
+                    {"range": [0, 25], "color": "#2b3a34"},
+                    {"range": [25, 65], "color": "#163c2e"},
+                    {"range": [65, 80], "color": "#2b3a34"},
                 ],
-                "Temperature": [
-                    temperature - 1.8,
-                    temperature - 1.2,
-                    temperature - 1.4,
-                    temperature - .4,
-                    temperature + .2,
-                    temperature + .7,
-                    temperature,
-                ],
-                "Pressure": [
-                    pressure + 12,
-                    pressure + 17,
-                    pressure + 9,
-                    pressure + 3,
-                    pressure - 5,
-                    pressure - 12,
-                    pressure,
-                ],
-            }
+            },
         )
-
-        fig2 = go.Figure()
-
-        fig2.add_trace(
-            go.Scatter(
-                x=trend_df["Reading"],
-                y=trend_df["Temperature"],
-                name="Temperature",
-                mode="lines+markers",
-                line=dict(
-                    color="#65e7b8",
-                    width=2,
-                ),
-                marker=dict(size=5),
-            )
-        )
-
-        fig2.add_trace(
-            go.Scatter(
-                x=trend_df["Reading"],
-                y=trend_df["Pressure"],
-                name="Pressure",
-                mode="lines+markers",
-                line=dict(
-                    color="#c8d8d2",
-                    width=2,
-                ),
-                marker=dict(size=5),
-                yaxis="y2",
-            )
-        )
-
-        fig2.update_layout(
-            height=245,
-            margin=dict(l=20, r=20, t=15, b=20),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(color="#9ac5b8", size=10),
-            legend=dict(
-                orientation="h",
-                y=1.12,
-                x=0,
-            ),
-            xaxis=dict(
-                showgrid=False,
-                zeroline=False,
-            ),
-            yaxis=dict(
-                title="°C",
-                showgrid=True,
-                gridcolor="rgba(100,255,200,.07)",
-            ),
-            yaxis2=dict(
-                title="kPa",
-                overlaying="y",
-                side="right",
-                showgrid=False,
-            ),
-        )
-
-        st.plotly_chart(
-            fig2,
-            use_container_width=True,
-            config={"displayModeBar": False},
-        )
-
-    with health_col:
-
-        health_class = (
-            "status-online"
-            if ai_health == "HEALTHY"
-            else "status-monitor"
-        )
-
-        st.markdown(
-            f"""
-            <div class="chart-panel">
-                <div class="section-title">AI system health</div>
-
-                <div style="
-                    font-size:1.35rem;
-                    font-weight:800;
-                    margin-bottom:.8rem;">
-                    <span class="{health_class}">
-                        ● {ai_health}
-                    </span>
-                </div>
-
-                <div class="mini-card">
-                    <div class="mini-label">EFFICIENCY</div>
-                    <div class="mini-value">
-                        {metrics['efficiency_score']}%
-                    </div>
-                </div>
-
-                <div class="mini-card">
-                    <div class="mini-label">FORECAST</div>
-                    <div class="mini-value">
-                        {prediction:.2f} m³/day
-                    </div>
-                </div>
-
-                <div class="mini-card">
-                    <div class="mini-label">FEEDSTOCK SUITABILITY</div>
-                    <div class="mini-value">
-                        {metrics['feedstock_suitability']}%
-                    </div>
-                </div>
-
-                <div class="mini-card">
-                    <div class="mini-label">RISK</div>
-                    <div class="mini-value">
-                        {risk_level}
-                    </div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    # -------------------------
-    # BOTTOM KPI STRIP
-    # -------------------------
-
-    st.markdown(
-        '<div class="section-title">Energy intelligence</div>',
-        unsafe_allow_html=True,
     )
 
-    k1, k2, k3, k4 = st.columns(4)
-
-    with k1:
-        st.metric(
-            "Daily gas",
-            f"{metrics['daily_output']:.1f} m³",
-        )
-
-    with k2:
-        st.metric(
-            "Monthly projection",
-            f"{metrics['monthly_output']:.0f} m³",
-        )
-
-    with k3:
-        st.metric(
-            "CO₂ estimate",
-            f"{metrics['co2_reduction']:.1f} kg",
-        )
-
-    with k4:
-        st.metric(
-            "Energy estimate",
-            f"{metrics['energy_savings']:.1f} kWh",
-        )
-
-    # -------------------------
-    # ACTIVITY
-    # -------------------------
-
-    activity_col, status_col = st.columns([1.4, 1])
-
-    with activity_col:
-        activity_html = "<br>".join(
-            reversed(
-                st.session_state.activity_feed
-                or ["Awaiting system events..."]
-            )
-        )
-
-        st.markdown(
-            f"""
-            <div class="chart-panel">
-                <div class="section-title">Live activity</div>
-                <div class="activity">
-                    {activity_html}
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with status_col:
-        st.markdown(
-            f"""
-            <div class="chart-panel">
-                <div class="section-title">Current profile</div>
-
-                <div class="mini-label">FEEDSTOCK</div>
-                <div class="mini-value">{subtype}</div>
-
-                <div class="mini-label" style="margin-top:.7rem;">
-                    DIGESTER
-                </div>
-                <div class="mini-value">
-                    {digester_category}
-                </div>
-
-                <div class="mini-label" style="margin-top:.7rem;">
-                    LAST REFRESH
-                </div>
-                <div class="mini-value">
-                    {datetime.now().strftime("%H:%M:%S")}
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    st.markdown(
-        '<div class="footer-mark">HEXNN ENERGY SOLUTIONS • CLEAN ENERGY INTELLIGENCE</div>',
-        unsafe_allow_html=True,
+    temperature_fig.update_layout(
+        height=270,
+        margin=dict(l=20, r=20, t=45, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#dff5ea"),
     )
 
-
-# ============================================================
-# 🎛️ CONTROLS PAGE
-# ============================================================
-
-elif page == "Controls":
-
-    st.markdown(
-        '<div class="dashboard-title">System Controls</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.info(
-        "Prototype control interface. Physical control outputs are "
-        "not connected in this software-only deployment."
-    )
-
-    st.markdown(
-        '<div class="section-title">Feedstock intelligence</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.write(
-        f"**{subtype}** • {category}"
-    )
-
-    st.metric(
-        "Biochemical suitability",
-        f"{feedstock_profile['suitability']}%",
-    )
-
-    st.markdown(
-        '<div class="section-title">Digester capacity</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.write(
-        f"**{digester_category}** • "
-        f"{digester_profile['range']}"
-    )
-
-    st.metric(
-        "Prototype daily forecast",
-        f"{prediction:.2f} m³/day",
-    )
-
-
-# ============================================================
-# 🚨 ALERTS & SUBSCRIBE
-# ============================================================
-
-elif page == "Alerts & Subscribe":
-
-    st.markdown(
-        '<div class="dashboard-title">Alerts & Notifications</div>',
-        unsafe_allow_html=True,
-    )
-
-    alert_status = (
-        "Configured"
-        if BREVO_API_KEY and TELEGRAM_BOT_TOKEN
-        else "Needs configuration"
-    )
-
-    st.metric(
-        "Notification services",
-        alert_status,
-    )
-
-    st.markdown(
-        '<div class="section-title">Email subscription</div>',
-        unsafe_allow_html=True,
-    )
-
-    email_input = st.text_input(
-        "Email address",
-        placeholder="you@example.com",
-    )
-
-    if st.button(
-        "Subscribe to alerts",
+    st.plotly_chart(
+        temperature_fig,
         use_container_width=True,
-    ):
-        if email_input and "@" in email_input:
-            try:
-                c.execute(
-                    "INSERT OR IGNORE INTO subscribers (email) VALUES (?)",
-                    (email_input.strip(),),
-                )
-                conn.commit()
+    )
 
-                log_activity(
-                    "New email alert subscription"
-                )
+    p1, p2 = st.columns(2)
 
-                st.success(
-                    "✅ Email alerts enabled."
-                )
+    with p1:
+        st.markdown("#### Feedstock Level")
 
-            except sqlite3.Error as exc:
-                st.error(
-                    f"Subscription error: {exc}"
-                )
-        else:
-            st.error(
-                "Enter a valid email address."
+        feed_fig = go.Figure(
+            go.Indicator(
+                mode="gauge+number",
+                value=feedstock,
+                number={"suffix": "%"},
+                gauge={
+                    "axis": {"range": [0, 100]},
+                    "bar": {"color": "#48d597"},
+                },
             )
+        )
+
+        feed_fig.update_layout(
+            height=220,
+            margin=dict(l=20, r=20, t=20, b=20),
+            paper_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#dff5ea"),
+        )
+
+        st.plotly_chart(
+            feed_fig,
+            use_container_width=True,
+        )
+
+    with p2:
+        st.markdown("#### Gas Pressure")
+
+        pressure_fig = go.Figure(
+            go.Indicator(
+                mode="gauge+number",
+                value=pressure,
+                number={"suffix": " kPa"},
+                gauge={
+                    "axis": {"range": [0, 250]},
+                    "bar": {"color": "#59b6ff"},
+                },
+            )
+        )
+
+        pressure_fig.update_layout(
+            height=220,
+            margin=dict(l=20, r=20, t=20, b=20),
+            paper_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#dff5ea"),
+        )
+
+        st.plotly_chart(
+            pressure_fig,
+            use_container_width=True,
+        )
+
+
+with right:
+    st.markdown("### System Intelligence")
+
+    efficiency = metrics["efficiency_score"]
+
+    efficiency_fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=efficiency,
+            number={"suffix": "%"},
+            title={"text": "Operational Stability"},
+            gauge={
+                "axis": {"range": [0, 100]},
+                "bar": {"color": "#4ee09c"},
+                "steps": [
+                    {"range": [0, 50], "color": "#3a2929"},
+                    {"range": [50, 75], "color": "#3a3625"},
+                    {"range": [75, 100], "color": "#173a2d"},
+                ],
+            },
+        )
+    )
+
+    efficiency_fig.update_layout(
+        height=260,
+        margin=dict(l=20, r=20, t=40, b=20),
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#dff5ea"),
+    )
+
+    st.plotly_chart(
+        efficiency_fig,
+        use_container_width=True,
+    )
 
     st.markdown(
-        '<div class="section-title">Recent alerts</div>',
+        f"""
+        <div class="panel">
+            <b>Feedstock Intelligence</b><br><br>
+            Type: <b>{feedstock_type}</b><br>
+            C/N reference: <b>{feedstock_profile["cn_ratio"]}</b><br>
+            Volatile solids:
+            <b>{feedstock_profile["volatile_solids"]:.0%}</b><br>
+            Estimated methane:
+            <b>{feedstock_profile["methane"]}%</b>
+        </div>
+        """,
         unsafe_allow_html=True,
     )
+
+    st.markdown(
+        f"""
+        <div class="panel">
+            <b>Digester Profile</b><br><br>
+            Class: <b>{digester_type}</b><br>
+            Nominal size:
+            <b>{digester_profile["range"]}</b><br>
+            Reference output:
+            <b>{digester_profile["expected"]}</b>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ============================================================
+# PRODUCTION & IMPACT
+# ============================================================
+
+st.markdown("### Production & Impact")
+
+a, b, c, d = st.columns(4)
+
+with a:
+    st.metric(
+        "Daily biogas",
+        f'{metrics["daily_output"]:.2f} m³',
+    )
+
+with b:
+    st.metric(
+        "30-day projection",
+        f'{metrics["monthly_output"]:.1f} m³',
+    )
+
+with c:
+    st.metric(
+        "Energy estimate",
+        f'{metrics["energy_value"]:.1f} kWh/day',
+    )
+
+with d:
+    st.metric(
+        "CO₂ reduction estimate",
+        f'{metrics["co2_reduction"]:.1f} kg/month',
+    )
+
+
+# ============================================================
+# PROCESS TREND
+# ============================================================
+
+st.markdown("### Process Trend")
+
+trend = pd.DataFrame(
+    {
+        "Day": list(range(1, 8)),
+        "Temperature": [
+            max(0, temperature - 2),
+            max(0, temperature - 1),
+            temperature,
+            temperature + 1,
+            temperature,
+            max(0, temperature - 1),
+            temperature,
+        ],
+        "Pressure": [
+            max(0, pressure - 8),
+            max(0, pressure - 3),
+            pressure,
+            pressure + 4,
+            max(0, pressure - 2),
+            pressure + 2,
+            pressure,
+        ],
+        "Feedstock": [
+            max(0, feedstock - 9),
+            max(0, feedstock - 7),
+            max(0, feedstock - 5),
+            max(0, feedstock - 3),
+            max(0, feedstock - 2),
+            max(0, feedstock - 1),
+            feedstock,
+        ],
+    }
+)
+
+trend_fig = px.line(
+    trend,
+    x="Day",
+    y=["Temperature", "Pressure", "Feedstock"],
+    markers=True,
+)
+
+trend_fig.update_layout(
+    height=360,
+    margin=dict(l=20, r=20, t=20, b=20),
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
+    font=dict(color="#dff5ea"),
+    legend_title_text="",
+)
+
+trend_fig.update_xaxes(
+    gridcolor="rgba(120,180,150,0.10)"
+)
+
+trend_fig.update_yaxes(
+    gridcolor="rgba(120,180,150,0.10)"
+)
+
+st.plotly_chart(
+    trend_fig,
+    use_container_width=True,
+)
+
+
+# ============================================================
+# ALERT CENTER & SUBSCRIPTIONS
+# ============================================================
+
+left_alert, right_alert = st.columns([1.2, 1])
+
+with left_alert:
+    st.markdown("### Alert Center")
 
     if st.session_state.alert_log:
-        for log in reversed(
-            st.session_state.alert_log[-10:]
-        ):
-            st.write(log)
-    else:
-        st.caption("No alerts recorded in this session.")
+        alert_df = pd.DataFrame(
+            st.session_state.alert_log
+        )
 
+        st.dataframe(
+            alert_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.success(
+            "No alerts recorded in this session."
+        )
+
+with right_alert:
+    st.markdown("### Notifications")
+
+    with st.form("subscribe_form"):
+        email = st.text_input(
+            "Email address",
+            placeholder="you@example.com",
+        )
+
+        submitted = st.form_submit_button(
+            "Subscribe to alerts"
+        )
+
+        if submitted:
+            success, message = add_subscriber(email)
+
+            if success:
+                st.success(message)
+                log_activity(
+                    "New alert subscriber added."
+                )
+            else:
+                st.warning(message)
+
+    st.caption(
+        f"{len(get_subscribers())} email subscriber(s)"
+    )
+
+
+# ============================================================
+# ACTIVITY / TELEGRAM
+# ============================================================
+
+st.markdown("### Activity")
+
+activity_col, telegram_col = st.columns(2)
+
+with activity_col:
+    if st.session_state.activity_feed:
+        for item in st.session_state.activity_feed[:10]:
+            st.write(
+                f"**{item['time']}** — "
+                f"{item['message']}"
+            )
+    else:
+        st.caption("No activity yet.")
+
+with telegram_col:
     st.markdown(
-        '<div class="section-title">Service configuration</div>',
+        """
+        <div class="panel">
+            <b>Telegram monitoring channel</b><br><br>
+            Configured Telegram alerts can receive
+            system notifications from this dashboard.
+        </div>
+        """,
         unsafe_allow_html=True,
     )
 
-    st.write(
-        f"Brevo: {'● configured' if BREVO_API_KEY else '○ missing'}"
-    )
 
-    st.write(
-        f"Telegram: {'● configured' if TELEGRAM_BOT_TOKEN else '○ missing'}"
-    )
+# ============================================================
+# FOOTER
+# ============================================================
 
-    st.caption(
-        "API keys and bot credentials are read from Streamlit "
-        "Community Cloud Secrets and are never displayed here."
-    )
+st.markdown("---")
+
+st.caption(
+    "Hexnn Energy Solutions · Smart Biogas Platform · "
+    "Prototype monitoring environment"
+)
