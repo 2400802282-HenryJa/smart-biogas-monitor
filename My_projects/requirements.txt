@@ -1,5 +1,5 @@
-python-dotenv
 streamlit
 pandas
+plotly
+requests
 python-dotenv
-sib-api-v3-sdk
