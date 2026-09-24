@@ -665,12 +665,9 @@ with st.sidebar:
         value=110,
     )
 
-    st.markdown("---")
-    st.caption(
-        "Prototype monitoring controls. "
-        "Connect validated sensors before operational use."
-    )
-    with st.sidebar:
+    # ========================================================
+    # EMAIL TEST
+    # ========================================================
 
     st.markdown("---")
     st.subheader("📧 Email Test")
@@ -680,7 +677,10 @@ with st.sidebar:
         placeholder="your@email.com",
     )
 
-    if st.button("Send Test Email", use_container_width=True):
+    if st.button(
+        "Send Test Email",
+        use_container_width=True,
+    ):
 
         if not test_email:
             st.warning("Enter a test email address.")
@@ -699,6 +699,17 @@ with st.sidebar:
                 st.success(message)
             else:
                 st.error(message)
+
+    # ========================================================
+    # FOOTER NOTE
+    # ========================================================
+
+    st.markdown("---")
+
+    st.caption(
+        "Prototype monitoring controls. "
+        "Connect validated sensors before operational use."
+    )
 
 
 # ============================================================
