@@ -342,8 +342,18 @@ def log_activity(message):
 
 
 def send_email_alert(subject, body, receiver):
-    if not BREVO_API_KEY or not EMAIL_SENDER or not receiver:
-        return False, "Brevo configuration is missing."
+    """
+    Send a transactional email through Brevo REST API.
+    """
+
+    if not BREVO_API_KEY:
+        return False, "BREVO_API_KEY is missing."
+
+    if not EMAIL_SENDER:
+        return False, "EMAIL_SENDER is missing."
+
+    if not receiver:
+        return False, "Recipient email is missing."
 
     url = "https://api.brevo.com/v3/smtp/email"
 
@@ -358,15 +368,27 @@ def send_email_alert(subject, body, receiver):
             "name": "Hexnn Smart Biogas",
             "email": EMAIL_SENDER,
         },
-        "to": [{"email": receiver}],
+        "to": [
+            {
+                "email": receiver,
+            }
+        ],
         "subject": subject,
         "htmlContent": f"""
-        <div style="font-family:Arial,sans-serif;">
-            <h2>🌱 Hexnn Smart Biogas Alert</h2>
-            <p>{body}</p>
-            <hr>
-            <p>Hexnn Energy Solutions</p>
-        </div>
+            <html>
+                <body>
+                    <h2>🌱 Hexnn Smart Biogas Alert</h2>
+
+                    <p>{body}</p>
+
+                    <hr>
+
+                    <p>
+                        <strong>Hexnn Energy Solutions</strong><br>
+                        Smart Biogas Monitoring Platform
+                    </p>
+                </body>
+            </html>
         """,
     }
 
@@ -378,13 +400,31 @@ def send_email_alert(subject, body, receiver):
             timeout=20,
         )
 
-        if response.ok:
-            return True, "Email sent."
+        if response.status_code == 201:
+            try:
+                result = response.json()
+                message_id = result.get("messageId", "unknown")
 
-        return False, f"Brevo HTTP {response.status_code}"
+                return True, (
+                    f"Email dispatched successfully. "
+                    f"Message ID: {message_id}"
+                )
 
-    except requests.RequestException as exc:
-        return False, f"Email request failed: {exc}"
+            except ValueError:
+                return True, "Email dispatched successfully."
+
+        else:
+            return False, (
+                f"Brevo API error "
+                f"{response.status_code}: "
+                f"{response.text}"
+            )
+
+    except requests.RequestException as e:
+        return False, f"Network request failed: {str(e)}"
+
+    except Exception as e:
+        return False, f"Unexpected email error: {str(e)}"
 
 
 def send_telegram_message(message):
