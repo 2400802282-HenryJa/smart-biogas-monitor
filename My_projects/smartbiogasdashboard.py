@@ -670,6 +670,35 @@ with st.sidebar:
         "Prototype monitoring controls. "
         "Connect validated sensors before operational use."
     )
+    with st.sidebar:
+
+    st.markdown("---")
+    st.subheader("📧 Email Test")
+
+    test_email = st.text_input(
+        "Test recipient",
+        placeholder="your@email.com",
+    )
+
+    if st.button("Send Test Email", use_container_width=True):
+
+        if not test_email:
+            st.warning("Enter a test email address.")
+
+        else:
+            success, message = send_email_alert(
+                subject="🌱 Hexnn Smart Biogas Test",
+                body=(
+                    "This is a test email from the "
+                    "Hexnn Smart Biogas Monitoring Dashboard."
+                ),
+                receiver=test_email,
+            )
+
+            if success:
+                st.success(message)
+            else:
+                st.error(message)
 
 
 # ============================================================
