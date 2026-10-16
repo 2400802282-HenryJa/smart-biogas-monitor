@@ -769,7 +769,7 @@ st.markdown(
     <div class="hero">
         <h1>🌱 Hexnn Smart Biogas Monitoring</h1>
         <p>
-            Real-time prototype monitoring · AI-assisted forecasting ·
+            Real-time Telemetry monitoring · AI-assisted forecasting ·
             Feedstock intelligence
         </p>
     </div>
